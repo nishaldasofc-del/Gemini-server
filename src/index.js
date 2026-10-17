@@ -2,6 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import OpenAI from 'openai'; // Google AI Studio is reached through its OpenAI-compatible endpoint
+import { createStoryHandler } from './story.js';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -51,6 +52,7 @@ const TASKS = {
   quiz:  { maxTokens: 4000, history: 0,     system: 'You are a quiz generator. Output only valid JSON. No explanation, no markdown, no prose.' },
   agent: { maxTokens: 8000, history: 12000, system: 'You are SUNSETAI, an advanced coding agent.' },
   voice: { maxTokens: 512,  history: 6000,  model: process.env.MODEL_VOICE || 'gemini-2.5-flash-lite', fallback: ['gemini-2.5-flash'], system: 'You are SunsetAI, an intelligent voice assistant by NGAI. Be conversational and concise: 2-4 sentences unless detail is needed. No markdown in responses. Speak naturally as if in conversation.' },
+  report: { maxTokens: 700, history: 0,   system: 'You output only a single valid JSON object. No explanation, no markdown, no prose.' },
   title: { maxTokens: 40,   history: 0,     system: 'You write short chat titles. Output only the title, nothing else.' }
 };
 
@@ -110,11 +112,46 @@ const SEARCH_TOOL = {
   }
 };
 
+// ---- User report (personalisation): fetched on demand, never sent with every message ----
+const REPORT_API_URL = (process.env.REPORT_API_URL_BASE || 'https://zenoai-bot.vercel.app').replace(/\/+$/, '');
+const REPORT_TOOL = {
+  type: 'function',
+  function: {
+    name: 'read_user_report',
+    description: "Read the saved profile report about THIS user (summary, interests, preferred response style) built from their earlier chats. Call it when the user asks about themselves or what you know about them, refers to their own interests/background/preferences, or when a personal detail would clearly improve the answer and it is NOT already in this conversation. Do not call it for generic questions. Never tell the user a 'report' exists; just use what it says.",
+    // Gemini rejects an OBJECT schema with empty `properties`, so declare one optional, harmless field.
+    parameters: { type: 'object', properties: { reason: { type: 'string', description: 'Optional: what personal detail you need (a few words).' } } }
+  }
+};
+async function runReportTool(ctx) {
+  if (ctx.reportCache) return ctx.reportCache;
+  let out = 'No saved profile is available for this user. Do not guess personal details; ask them if it matters.';
+  try {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 4000);
+    const r = await fetch(REPORT_API_URL + '/api/profile', { method: 'POST', headers: { Authorization: 'Bearer ' + ctx.reportAuth }, signal: ctrl.signal });
+    clearTimeout(t);
+    if (r.ok) {
+      const j = await r.json();
+      const rep = j && j.report;
+      if (rep && (rep.summary || (rep.interests || []).length || (rep.communicationPreferences || []).length)) {
+        out = ['SAVED USER PROFILE (use naturally; never invent details beyond this):',
+          rep.summary ? 'About: ' + rep.summary : '',
+          (rep.interests || []).length ? 'Interests: ' + rep.interests.join('; ') : '',
+          (rep.communicationPreferences || []).length ? 'Preferred response style: ' + rep.communicationPreferences.join('; ') : ''
+        ].filter(Boolean).join('\n');
+      }
+    } else console.warn('report fetch http', r.status);
+  } catch (e) { console.warn('report fetch failed:', e.message); }
+  return (ctx.reportCache = out);
+}
+
 // Tools offered for one request (tasks and opted-out requests get none of the search tool)
 function toolsFor(ctx) {
   const t = [];
   if (ctx.useFiles && PROMPT_FILES.size > 0) t.push(PROMPT_TOOL);
   if (ctx.search) t.push(SEARCH_TOOL);
+  if (ctx.reportAuth) t.push(REPORT_TOOL);
   return t;
 }
 
@@ -181,6 +218,7 @@ async function runTool(call, ctx) {
     const r = await runSearchTool(call.args, ctx);
     return { content: r.content, query: r.query, sources: r.sources, images: r.images, failed: r.failed, isSearch: true };
   }
+  if (call.name === 'read_user_report') return { content: await runReportTool(ctx), name: 'read_user_report' };
   const r = runPromptTool(call.args);
   return { content: r.content, name: r.name };
 }
@@ -388,6 +426,7 @@ app.get(['/', '/health'], (req, res) => {
     research: SEARCH_ENABLED,
     promptFiles: [...PROMPT_FILES.keys()],
     richBlocks: 1,
+    story: 1,
     hasApiKey: Boolean(GEMINI_API_KEY)
   });
 });
@@ -622,7 +661,21 @@ async function streamResponse(req, res, options, ctx) {
   }
 }
 
+// Visual Storytelling Mode: task:'story' is handled by ./story.js (structured scene JSON over the same SSE framing)
+const handleStory = createStoryHandler({
+  createWithRetry, tpmBudget: TPM_BUDGET,
+  getModel: () => MODES.balanced.model, getFallback: () => MODES.balanced.fallback
+});
+
 const handleGenerate = async (req, res) => {
+  if (String(req.body?.task || '').toLowerCase() === 'story') {
+    try { return await handleStory(req, res); }
+    catch (error) {
+      console.error('Story handler error:', error.message || error);
+      if (res.headersSent) return res.end();
+      return res.status(500).json({ success: false, error: error.message || 'Story generation failed.' });
+    }
+  }
   try {
     const modeName = MODES[String(req.body?.mode || '').toLowerCase()] ? String(req.body.mode).toLowerCase() : DEFAULT_MODE;
     const taskName = TASKS[String(req.body?.task || '').toLowerCase()] ? String(req.body.task).toLowerCase() : null;
@@ -633,7 +686,8 @@ const handleGenerate = async (req, res) => {
       : MODES[modeName];
     // Auto web search: chat only (not tasks), unless the client already searched (manual toggle) or opts out with search:false
     const search = SEARCH_ENABLED && !task && req.body?.search !== false;
-    const ctx = { name: taskName || modeName, task: Boolean(task), useFiles: mode.files && PROMPT_FILES.size > 0, search, searches: 0, fallback: mode.fallback, pace: mode.pace !== false };
+    const reportAuth = (!task && typeof req.body?.reportAuth === 'string' && req.body.reportAuth.length > 100 && req.body.reportAuth.length < 4000) ? req.body.reportAuth : '';
+    const ctx = { reportAuth, name: taskName || modeName, task: Boolean(task), useFiles: mode.files && PROMPT_FILES.size > 0, search, searches: 0, fallback: mode.fallback, pace: mode.pace !== false };
     const taskSystem = task
       ? ((typeof req.body.system === 'string' && req.body.system.trim()) ? req.body.system.trim().slice(0, 30000) : task.system)
       : undefined;
